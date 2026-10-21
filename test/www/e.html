@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>FScreen test E - the pane stops at the player box</title>
+<!--
+  The Alt+` bug reported against a real anime site, reduced to its shape:
+
+    .anis-watch          the watch page section (player + servers + episodes)
+      .watch-player      the player shell (also owns the toolbar row)
+        .player-frame    the box that actually holds the <video>
+        .toolbar         small control row directly under the player
+      .player-servers    server list, "You're watching...", SUB / DUB
+      .other-season      another row of page content
+      .episodes          episode grid
+
+  Every wrapper from the <video> up to .anis-watch "contains the player", and
+  each step grows by less than the 2.5x area cap - so the resolver happily kept
+  climbing into the page section. Restyling that section fills the tab with a
+  black rectangle that still contains the rest of the page: the video keeps its
+  old slice at the top and the server list, seasons and episodes stay visible
+  underneath. The pane has to stop at the box that owns the player, and small
+  content of its own (the toolbar) may come along - whole page sections may not.
+-->
+<style>
+  body { margin: 0; background: #111; color: #eee; font: 14px system-ui; }
+  #siteheader { position: sticky; top: 0; height: 56px; background: #1b1b24; z-index: 5; padding: 18px; box-sizing: border-box; }
+  .anis-watch { position: relative; }
+  .player-frame { width: 100%; height: 360px; background: #000; position: relative; }
+  .player-frame video { width: 100%; height: 100%; display: block; object-fit: contain; }
+  .toolbar { width: 100%; height: 33px; background: #222; color: #999; padding: 7px 12px; box-sizing: border-box; }
+  .player-servers { height: 120px; background: #17171c; padding: 16px; box-sizing: border-box; }
+  .other-season { height: 100px; background: #14141a; padding: 16px; box-sizing: border-box; }
+  .episodes { height: 300px; background: #12121a; padding: 16px; box-sizing: border-box; }
+  #results { white-space: pre-wrap; padding: 16px; }
+</style>
+</head>
+<body>
+<header id="siteheader">Site header</header>
+<div class="anis-watch" id="watch">
+  <div class="watch-player" id="shell">
+    <div class="player-frame" id="frame">
+      <video id="v"></video>
+    </div>
+    <div class="toolbar" id="toolbar">Auto Play | Auto Next | Auto Skip | Light | Prev | Next</div>
+  </div>
+  <div class="player-servers" id="servers">You're watching Episode 1<br>SUB &nbsp; DUB</div>
+  <div class="other-season" id="other">Other Season</div>
+  <div class="episodes" id="eps">Episode list</div>
+</div>
+<pre id="results">running...</pre>
+<script>
+(function () {
+  var checks = {};
+  function expect(name, pass, detail) {
+    checks[name] = { pass: !!pass, detail: detail === undefined ? null : detail };
+  }
+  var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+
+  var shell = document.getElementById('shell');    // watch-player
+  var watch = document.getElementById('watch');    // anis-watch (page section)
+  var frame = document.getElementById('frame');    // player-frame
+  var video = document.getElementById('v');
+  var servers = document.getElementById('servers');
+  var pos = function (el) { return el.style.getPropertyValue('position'); };
+  var px = function (el, prop) { return parseFloat(getComputedStyle(el)[prop]); };
+  var pane = function () {
+    return !!document.getElementById('fscreen-exit') && !!document.getElementById('fscreen-style');
+  };
+  var sel = function (el) {
+    return el ? (el.tagName.toLowerCase() + (el.id ? '#' + el.id : '') +
+      (el.className ? '.' + String(el.className).split(/\s+/)[0] : '')) : String(el);
+  };
+  var fills = function (el) {
+    return Math.abs(px(el, 'width') - window.innerWidth) < 3 &&
+           Math.abs(px(el, 'height') - window.innerHeight) < 3;
+  };
+
+  (async function () {
+    await sleep(80);
+
+    window.dispatchEvent(new KeyboardEvent('keydown',
+      { key: '`', code: 'Backquote', altKey: true, bubbles: true, cancelable: true }));
+    await sleep(200);
+
+    expect('hotkey_styles_player_box', pos(frame) === 'fixed', JSON.stringify(pos(frame)));
+
+    // The regression: neither the page section that wraps the player nor the
+    // shell under it may be what gets restyled - that is what leaves the rest
+    // of the page sitting inside the pane.
+    expect('page_section_left_alone',
+      pos(watch) !== 'fixed' && pos(shell) !== 'fixed' && pos(servers) !== 'fixed',
+      'watch=' + JSON.stringify(pos(watch)) + ' shell=' + JSON.stringify(pos(shell)) +
+      ' servers=' + JSON.stringify(pos(servers)));
+
+    expect('pane_fills_viewport', pane() && fills(frame),
+      'w=' + px(frame, 'width') + ' h=' + px(frame, 'height') +
+      ' inner=' + window.innerWidth + 'x' + window.innerHeight + ' pane=' + pane());
+
+    // The video itself has to end up covering the tab - this is the part the
+    // user sees as "the video did not fill the tab".
+    expect('video_fills_pane', fills(video),
+      'w=' + px(video, 'width') + ' h=' + px(video, 'height') +
+      ' inner=' + window.innerWidth + 'x' + window.innerHeight);
+
+    // The rest of the watch page has to end up BEHIND the pane, not inside it.
+    var r = servers.getBoundingClientRect();
+    var hit = document.elementFromPoint(
+      Math.round(r.left + r.width / 2), Math.round(r.top + r.height / 2));
+    expect('page_content_behind_pane',
+      !!hit && (hit === frame || frame.contains(hit)),
+      sel(hit));
+
+    // What the page hears back while the pane is up.
+    expect('hotkey_reports_page_level_element',
+      document.fullscreenElement === document.documentElement,
+      sel(document.fullscreenElement));
+
+    window.dispatchEvent(new KeyboardEvent('keydown',
+      { key: 'Escape', bubbles: true, cancelable: true }));
+    await sleep(150);
+    expect('escape_restores_everything',
+      pos(frame) === '' && pos(shell) === '' && pos(watch) === '' && !pane(),
+      'frame=' + JSON.stringify(pos(frame)) + ' shell=' + JSON.stringify(pos(shell)) +
+      ' watch=' + JSON.stringify(pos(watch)) + ' pane=' + pane());
+
+    window.__done = true;
+    document.getElementById('results').textContent = JSON.stringify(checks, null, 2);
+  })();
+})();
+</script>
+</body>
+</html>

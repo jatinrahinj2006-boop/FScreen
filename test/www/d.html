@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>FScreen test D - interception is opt-in, Alt+` always works</title>
+<!--
+  The split the user asked for:
+
+    F key / the site's fullscreen button  ->  real fullscreen (FScreen out of it)
+    Alt+`                                 ->  our pane-relative fullscreen
+
+  So interception is OFF by default and only the toolbar icon turns it on for a
+  tab. Alt+` must work in both states - that is the whole point of the shortcut.
+-->
+<script>
+/* FIRST page script: document_start must already have patched the prototype. */
+window.__checks = {};
+(function (name, pass, detail) {
+  window.__checks[name] = { pass: !!pass, detail: detail === undefined ? null : detail };
+})('main_world_injected', !!window.__FSCREEN__, String(window.__FSCREEN__));
+</script>
+<style>
+  body { margin: 0; background: #111; color: #eee; font: 14px system-ui; }
+  #stage { padding: 30px; }
+  #player { width: 320px; height: 180px; background: #06c; position: relative; }
+  #results { white-space: pre-wrap; padding: 16px; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="player">
+    <video id="v"></video>
+    <button id="fs">Fullscreen</button>
+  </div>
+</div>
+<pre id="results">running...</pre>
+<script>
+(function () {
+  var checks = window.__checks;
+  function expect(name, pass, detail) {
+    checks[name] = { pass: !!pass, detail: detail === undefined ? null : detail };
+  }
+  var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+
+  var player = document.getElementById('player');
+  var btn = document.getElementById('fs');
+  var pos = function () { return player.style.getPropertyValue('position'); };
+  var pane = function () {
+    return !!document.getElementById('fscreen-exit') && !!document.getElementById('fscreen-style');
+  };
+  var arm = function (on) {
+    window.postMessage({ __fscreen: 1, type: 'state', enabled: on }, '*');
+  };
+
+  // Exactly what a real player's own fullscreen button does - and what the F
+  // key makes YouTube do.
+  btn.addEventListener('click', function () {
+    player.requestFullscreen().catch(function () {});
+  });
+
+  (async function () {
+    await sleep(80);
+
+    /* 1. default: the site's fullscreen request is left alone */
+    btn.click();
+    await sleep(120);
+    expect('site_fullscreen_left_alone',
+      pos() !== 'fixed' && !pane(),
+      'position=' + JSON.stringify(pos()) + ' pane=' + pane() +
+      ' fsEl=' + String(document.fullscreenElement));
+
+    /* 2. Alt+` works anyway - interception being off does not disable it */
+    window.dispatchEvent(new KeyboardEvent('keydown',
+      { key: '`', code: 'Backquote', altKey: true, bubbles: true, cancelable: true }));
+    await sleep(150);
+    expect('hotkey_works_while_off', pos() === 'fixed' && pane(),
+      'position=' + JSON.stringify(pos()) + ' pane=' + pane());
+    expect('hotkey_fills_viewport',
+      Math.abs(parseFloat(getComputedStyle(player).width) - window.innerWidth) < 3,
+      parseFloat(getComputedStyle(player).width) + ' vs innerWidth ' + window.innerWidth);
+    // What the page hears back. Sites compare document.fullscreenElement with
+    // the element THEY asked for before they will exit (YouTube:
+    // `fullscreenElement == document.documentElement`), so a hotkey enter -
+    // which never had a request behind it - has to answer like the page-level
+    // request those players make themselves. Answering with the element we
+    // restyle instead makes their F key a silent no-op.
+    expect('hotkey_reports_page_level_element',
+      document.fullscreenElement === document.documentElement,
+      document.fullscreenElement && (document.fullscreenElement.id || document.fullscreenElement.tagName));
+
+    // Exactly YouTube's exit path: it only calls exitFullscreen() when the
+    // guard above holds.
+    if (document.fullscreenElement === document.documentElement) {
+      try { await document.exitFullscreen(); } catch (e) { /* ignore */ }
+    }
+    await sleep(150);
+    expect('site_exit_guard_exits', pos() === '' && !pane(),
+      'position=' + JSON.stringify(pos()) + ' pane=' + pane());
+
+    // Esc still gets us out of a hotkey-entered pane.
+    window.dispatchEvent(new KeyboardEvent('keydown',
+      { key: '`', code: 'Backquote', altKey: true, bubbles: true, cancelable: true }));
+    await sleep(150);
+    expect('hotkey_reenters', pos() === 'fixed', JSON.stringify(pos()));
+
+    window.dispatchEvent(new KeyboardEvent('keydown',
+      { key: 'Escape', bubbles: true, cancelable: true }));
+    await sleep(120);
+    expect('hotkey_exits', pos() === '' && !pane(), 'position=' + JSON.stringify(pos()));
+
+    /* 3. toolbar icon opt-in: the site's fullscreen is redirected again */
+    arm(true);
+    await sleep(120);
+    btn.click();
+    await sleep(120);
+    expect('opt_in_intercepts', pos() === 'fixed' && pane(),
+      'position=' + JSON.stringify(pos()) + ' pane=' + pane());
+    expect('opt_in_fakes_fullscreenElement', document.fullscreenElement === player,
+      document.fullscreenElement && (document.fullscreenElement.id || document.fullscreenElement.tagName));
+
+    /* 4. opt-out: style is dropped immediately and stays dropped */
+    arm(false);
+    await sleep(120);
+    expect('opt_out_exits', pos() === '' && !pane(),
+      'position=' + JSON.stringify(pos()) + ' pane=' + pane());
+    btn.click();
+    await sleep(120);
+    expect('opt_out_leaves_alone', pos() !== 'fixed' && !pane(),
+      'position=' + JSON.stringify(pos()) + ' pane=' + pane());
+
+    /* 5. a second opt-in/Alt+` round still works after all of that */
+    arm(true);
+    await sleep(120);
+    window.dispatchEvent(new KeyboardEvent('keydown',
+      { key: '`', code: 'Backquote', altKey: true, bubbles: true, cancelable: true }));
+    await sleep(150);
+    expect('hotkey_still_works_on', pos() === 'fixed', JSON.stringify(pos()));
+
+    window.__done = true;
+    document.getElementById('results').textContent = JSON.stringify(checks, null, 2);
+  })();
+})();
+</script>
+</body>
+</html>

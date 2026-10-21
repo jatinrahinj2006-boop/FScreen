@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>FScreen test B - cross-origin iframe</title>
+</head>
+<body style="margin:0;background:#111;color:#eee;font:14px system-ui">
+<!--
+  Parent origin:  http://127.0.0.1:<port>   (allowlisted by the test manifest)
+  Child  origin:  http://localhost:<port>   (cross-origin, also allowlisted)
+
+  The parent page script has no DOM access to the child, so every assertion
+  about the child has to come back over postMessage - same as the extension.
+-->
+<div style="padding:24px">
+  <iframe id="f" width="640" height="360" allow="fullscreen" allowfullscreen
+          style="border:2px solid #c33;background:#000"></iframe>
+</div>
+<pre id="results" style="white-space:pre-wrap;padding:16px">running...</pre>
+<script>
+(function () {
+  var checks = {};
+  var msgs = [];
+  var loads = 0;
+  var frame = document.getElementById('f');
+
+  var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+
+  function send(name, pass, detail) {
+    checks[name] = { pass: !!pass, detail: detail === undefined ? null : detail };
+  }
+  function px(el, prop) { return parseFloat(getComputedStyle(el)[prop]); }
+
+  window.addEventListener('message', function (e) {
+    var d = e.data;
+    msgs.push(d && d.__fstest ? d.name : ('raw:' + String(JSON.stringify(d)).slice(0, 90)));
+    if (!d || d.__fstest !== 1) return;
+    send(d.name, d.pass, d.detail);
+  });
+
+  // Wait for a child report instead of guessing at timings: the iframe has its
+  // own network delay and its own timers. Virtual time fast-forwards our timers,
+  // but the child lives in a separate renderer process (site isolation) and only
+  // moves in real time - so every wait opens a real-time window first.
+  function realWait(ms) {
+    return fetch('/realwait?ms=' + ms).then(function () {}, function () {});
+  }
+  async function waitFor(name, ms) {
+    await realWait(60);
+    var t0 = Date.now();
+    while (!checks[name] && Date.now() - t0 < ms) {
+      await sleep(50);
+      if (!checks[name]) await realWait(30);
+    }
+    return !!checks[name];
+  }
+
+  function sendGo() {
+    try { frame.contentWindow.postMessage({ __fstest: 1, go: true }, '*'); } catch (e) {}
+  }
+
+  frame.addEventListener('load', function () { loads++; sendGo(); });
+  frame.src = 'http://localhost:' + location.port + '/embed.html';
+
+  setTimeout(async function () {
+    try {
+      send('parent_timer_reached', true, null);
+
+      await waitFor('child_got_go', 6000);
+      send('child_frame_loaded', loads > 0, 'loads=' + loads);
+      send('child_got_go_seen',
+        !!checks.child_got_go && checks.child_got_go.pass,
+        'msgs so far: ' + JSON.stringify(msgs));
+      if (!await waitFor('child_position_fixed', 3000)) {
+        send('child_position_fixed', false, 'child never reported its state');
+      }
+
+      send('parent_expands_iframe',
+        frame.style.getPropertyValue('position') === 'fixed',
+        JSON.stringify(frame.style.getPropertyValue('position')));
+      send('parent_iframe_fills_tab',
+        Math.abs(px(frame, 'width') - window.innerWidth) < 4,
+        px(frame, 'width') + ' vs innerWidth ' + window.innerWidth);
+      send('parent_iframe_height',
+        Math.abs(px(frame, 'height') - window.innerHeight) < 4,
+        px(frame, 'height') + ' vs innerHeight ' + window.innerHeight);
+      send('parent_fakes_fullscreenElement',
+        document.fullscreenElement === frame,
+        document.fullscreenElement && (document.fullscreenElement.id || document.fullscreenElement.tagName));
+      send('parent_shows_exit_button', !!document.getElementById('fscreen-exit'));
+
+      // Escape in the top document must unwind the whole thing, child included.
+      window.dispatchEvent(new KeyboardEvent('keydown',
+        { key: 'Escape', bubbles: true, cancelable: true }));
+
+      await waitFor('child_sees_parent_exit', 3000);
+      if (!checks.child_sees_parent_exit) {
+        send('child_sees_parent_exit', false, 'child never reported back');
+      }
+      if (!checks.child_button_removed) {
+        send('child_button_removed', false, 'child never reported back');
+      }
+
+      send('escape_unwinds_parent',
+        frame.style.getPropertyValue('position') === '',
+        JSON.stringify(frame.style.getPropertyValue('position')));
+      send('escape_removes_parent_button', !document.getElementById('fscreen-exit'));
+      send('escape_clears_parent_fullscreenElement',
+        document.fullscreenElement === null, String(document.fullscreenElement));
+      send('escape_reaches_child',
+        !!checks.child_sees_parent_exit && checks.child_sees_parent_exit.pass,
+        checks.child_sees_parent_exit ? checks.child_sees_parent_exit.detail : 'child never reported back');
+      send('child_button_removed',
+        !!checks.child_button_removed && checks.child_button_removed.pass,
+        checks.child_button_removed && checks.child_button_removed.detail);
+    } catch (e) {
+      send('parent_error', false, String((e && e.stack) || e));
+    }
+    window.__done = true;
+    document.getElementById('results').textContent =
+      JSON.stringify({ checks: checks, msgs: msgs }, null, 2);
+  }, 100);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>FScreen test G - the pane has to escape the site's stacking context</title>
+<!--
+  The reported symptom: "it half works, some site content is still there".
+
+  A site wrapper like `div.anis-watch-wrap { position:relative; z-index:3 }`
+  around the player opens a stacking context. Our z-index:2147483647 is only
+  compared *inside* that context, so the page is pinned at level 3 while the
+  site's fixed header sits in the root context at 9999 - the header keeps
+  painting across the top of "fullscreen".
+
+  #trap below is that wrapper (z-index AND opacity, both context creators),
+  #topbar is the header, and #shows is page content that has to keep the
+  resolver from climbing out of the player box.
+-->
+<script>
+/* FIRST page script: document_start must already have patched the prototype. */
+window.__checks = {};
+(function (name, pass, detail) {
+  window.__checks[name] = { pass: !!pass, detail: detail === undefined ? null : detail };
+})('main_world_injected', !!window.__FSCREEN__, String(window.__FSCREEN__));
+</script>
+<style>
+  body { margin: 0; background: #111; color: #eee; font: 14px system-ui; }
+  #topbar { position: fixed; top: 0; left: 0; right: 0; height: 46px;
+            background: #b00; z-index: 9999; }
+  #topbar span { display: inline-block; padding: 13px 12px; }
+  #trap { position: relative; z-index: 3; opacity: .9; margin-top: 70px; }
+  #box { width: 640px; height: 360px; background: #06c; }
+  #shows { margin-top: 8px; height: 160px; background: #333; }
+  #results { white-space: pre-wrap; padding: 16px; }
+</style>
+</head>
+<body>
+<div id="topbar"><span>site menu</span></div>
+<div id="trap">
+  <div id="box"><video id="a"></video></div>
+  <div id="shows">related shows / servers / episodes</div>
+</div>
+<pre id="results">running...</pre>
+<script>
+(function () {
+  var checks = window.__checks;
+  function expect(name, pass, detail) {
+    checks[name] = { pass: !!pass, detail: detail === undefined ? null : detail };
+  }
+  var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+  var desc = function (e) {
+    return e ? (e.tagName.toLowerCase() + (e.id ? '#' + e.id : '') +
+      (typeof e.className === 'string' && e.className ? '.' + e.className.trim().split(/\s+/).slice(0, 3).join('.') : ''))
+      : null;
+  };
+  var press = function () {
+    window.dispatchEvent(new KeyboardEvent('keydown',
+      { key: '`', code: 'Backquote', altKey: true, bubbles: true, cancelable: true }));
+  };
+  var trap = document.getElementById('trap');
+  var box = document.getElementById('box');
+  var topbar = document.getElementById('topbar');
+  var pane = function () { return !!document.getElementById('fscreen-exit'); };
+  var styled = function () {
+    var found = null;
+    document.querySelectorAll('*').forEach(function (e) {
+      if (e.style && e.style.getPropertyValue('position') === 'fixed' &&
+          e.style.getPropertyPriority('position') === 'important' &&
+          e.style.getPropertyValue('height') === '100vh') found = e;
+    });
+    return found;
+  };
+  var esc = function () {
+    window.dispatchEvent(new KeyboardEvent('keydown',
+      { key: 'Escape', code: 'Escape', bubbles: true, cancelable: true }));
+  };
+
+  (async function () {
+    await sleep(250);
+
+    press();
+    await sleep(300);
+
+    var el = styled();
+    expect('pane_opened', pane() && !!el, 'pane=' + pane() + ' styled=' + desc(el));
+    // The resolver must stop at the player box: #trap owns #shows around it.
+    expect('target_is_the_player_box', el === box, desc(el));
+
+    var c = getComputedStyle(trap);
+    expect('trap_stack_context_released_while_open',
+      c.zIndex === 'auto' && parseFloat(c.opacity) === 1,
+      'z-index=' + c.zIndex + ' opacity=' + c.opacity);
+
+    // The whole point: nothing but our own UI may be painted anywhere.
+    var btn = document.getElementById('fscreen-exit');
+    var leaks = [];
+    for (var fx = 0.05; fx <= 0.96; fx += 0.3) {
+      for (var fy = 0.05; fy <= 0.96; fy += 0.3) {
+        var x = Math.round(innerWidth * fx), y = Math.round(innerHeight * fy);
+        var hit = document.elementFromPoint(x, y);
+        if (!hit) continue;
+        if (btn && (hit === btn || btn.contains(hit))) continue;
+        if (el && (hit === el || el.contains(hit))) continue;
+        leaks.push(x + ',' + y + ' -> ' + desc(hit));
+      }
+    }
+    expect('nothing_paints_over_the_pane', leaks.length === 0, leaks.slice(0, 6).join(' | '));
+
+    // The header band specifically: this is what "site content still there"
+    // looked like on hianime.at.
+    var headerHit = document.elementFromPoint(20, 20);
+    expect('site_header_hidden',
+      !!headerHit && !topbar.contains(headerHit) && !!el &&
+        (headerHit === el || el.contains(headerHit)),
+      desc(headerHit));
+
+    esc();
+    await sleep(300);
+
+    var back = getComputedStyle(trap);
+    expect('trap_styles_restored',
+      back.zIndex === '3' && Math.abs(parseFloat(back.opacity) - 0.9) < 0.01 &&
+        trap.style.getPropertyValue('z-index') === '' &&
+        trap.style.getPropertyValue('opacity') === '',
+      'z-index=' + back.zIndex + ' opacity=' + back.opacity +
+        ' inline=' + JSON.stringify(trap.getAttribute('style')));
+    expect('pane_closed', !pane(), 'pane=' + pane());
+
+    // Back on top once we are gone - we restored, we did not just cover it.
+    var after = document.elementFromPoint(20, 20);
+    expect('site_header_back', !!after && topbar.contains(after), desc(after));
+
+    // ...and a second round still works (restore must not leave debris).
+    press();
+    await sleep(300);
+    var again = styled();
+    expect('reenter_still_covers_header',
+      pane() && !!again && (function () {
+        var h = document.elementFromPoint(20, 20);
+        return !!h && !topbar.contains(h);
+      })(),
+      'pane=' + pane() + ' styled=' + desc(again));
+
+    window.__done = true;
+    document.getElementById('results').textContent = JSON.stringify(checks, null, 2);
+  })();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>FScreen test H - a gesture-less fullscreen request must not reach window</title>
+<!--
+  anikototv.to main.js, verbatim:
+
+    function checkIframeSrc(){ let t = setInterval(() => {
+        let i = document.querySelector("#player iframe");
+        i && i.src && (requestFullscreen(), clearInterval(t))     // <- from a timer
+      }, 500) }
+    function requestFullscreen(){ let t = document.querySelector("#player iframe");
+        t.requestFullscreen ? t.requestFullscreen() : ... }       // <- our fakeRequest
+
+  The browser refuses (no transient activation), the promise rejects, the site
+  has no .catch, so the rejection reaches window.onunhandledrejection and its
+  error overlay prints the stack - which starts in src/content-main.js,
+  because we are the requestFullscreen() implementation. That is the report the
+  user filed. Without FScreen the identical rejection fires with the site's own
+  script in that stack.
+
+  This page repeats the site's call verbatim and asserts three things: the page
+  still gets a rejected promise (we did not swallow its outcome), nothing
+  unhandled escapes to the window (the overlay has nothing to draw), and no
+  pane opened by itself.
+-->
+<script>
+/* FIRST page script: document_start must already have patched the prototype. */
+window.__checks = {};
+(function (name, pass, detail) {
+  window.__checks[name] = { pass: !!pass, detail: detail === undefined ? null : detail };
+})('main_world_injected', !!window.__FSCREEN__, String(window.__FSCREEN__));
+</script>
+<style>
+  body { margin: 0; background: #111; color: #eee; font: 14px system-ui; }
+  #box { width: 640px; height: 360px; background: #06c; }
+  #results { white-space: pre-wrap; padding: 16px; }
+</style>
+</head>
+<body>
+<div id="box"><video id="a"></video></div>
+<pre id="results">running...</pre>
+<script>
+(function () {
+  var checks = window.__checks;
+  function expect(name, pass, detail) {
+    checks[name] = { pass: !!pass, detail: detail === undefined ? null : detail };
+  }
+  var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+
+  /* What the site's error overlay hooks. */
+  window.__escaped = [];
+  window.addEventListener('unhandledrejection', function (ev) {
+    var msg = 'unhandledrejection: ' + String((ev.reason && ev.reason.message) || ev.reason);
+    console.log('[H] window handler saw -> ' + msg);
+    window.__escaped.push(msg);
+  });
+  window.addEventListener('error', function (ev) {
+    window.__escaped.push('error: ' + String(ev.message));
+  });
+
+  /* Control: prove this page's window handler works at all before we assert
+     that something did NOT reach it. */
+  window.__control = Promise.reject(new Error('h-control'));
+
+  (async function () {
+    /* Real time, not virtual: --virtual-time-budget fast-forwards page timers,
+       but the browser settles the fullscreen promise on its own task queue.
+       Each round also gives a task boundary, because the "unhandled rejection"
+       check runs at the END of a microtask checkpoint - i.e. after the
+       continuation that resumes from this fetch. One round is a race we would
+       always lose, so we poll. */
+    async function realRounds(n) {
+      for (var i = 0; i < n && window.__escaped.length === 0; i++) {
+        try { await fetch('/realwait?ms=400'); } catch (e) { await sleep(400); }
+        await sleep(20);
+      }
+    }
+
+    await realRounds(2);
+    expect('control_rejection_reaches_window',
+      window.__escaped.some(function (s) { return s.indexOf('h-control') > -1; }),
+      JSON.stringify(window.__escaped));
+    window.__escaped = [];
+
+    await sleep(250);
+
+    /* The site's call, exactly: from a timer, therefore no user gesture. */
+    var outcome = await new Promise(function (resolve) {
+      setTimeout(function () {
+        var p;
+        try {
+          window.__activationAtCall = navigator.userActivation
+            ? navigator.userActivation.isActive : null;
+          p = document.getElementById('a').requestFullscreen();
+        } catch (e) {
+          resolve({ threw: String((e && e.message) || e) });
+          return;
+        }
+        if (!p || typeof p.then !== 'function') {
+          resolve({ notAPromise: true });
+          return;
+        }
+        p.then(
+          function () { resolve({ resolved: true }); },
+          function (e) { resolve({ rejected: String((e && e.message) || e) }); }
+        );
+      }, 0);
+    });
+
+    expect('page_got_a_real_promise',
+      !outcome.threw && !outcome.notAPromise, JSON.stringify(outcome));
+    expect('page_still_sees_the_refusal',
+      typeof outcome.rejected === 'string' || outcome.resolved === true,
+      JSON.stringify(outcome));
+
+    /* (2) the site's call verbatim: nobody attaches a handler, so without the
+       defusal this rejection is what reaches window.onunhandledrejection and
+       feeds the site's error overlay. */
+    await new Promise(function (resolve) {
+      setTimeout(function () {
+        window.__activationAtCall = navigator.userActivation
+          ? navigator.userActivation.isActive : null;
+        try {
+          window.__bare = document.getElementById('a').requestFullscreen();
+        } catch (e) {
+          window.__bare = 'threw: ' + String((e && e.message) || e);
+        }
+        resolve();
+      }, 0);
+    });
+
+    /* Let the bare call's rejection reach the window, if it is going to. */
+    await realRounds(4);
+
+    expect('bare_call_was_not_swallowed',
+      !!window.__bare && typeof window.__bare.then === 'function',
+      String(window.__bare));
+
+    /* What we actually depend on: the call had no transient activation, so
+       real fullscreen was impossible before we ever saw it. The refusal text
+       varies with the environment (headless reports the permissions wording),
+       so it is recorded here rather than asserted. */
+    expect('called_without_user_activation',
+      window.__activationAtCall === false,
+      JSON.stringify({ isActive: window.__activationAtCall,
+                       fullscreenEnabled: document.fullscreenEnabled,
+                       refusal: outcome.rejected }));
+
+    expect('nothing_escapes_to_window_handlers',
+      window.__escaped.length === 0, window.__escaped.slice(0, 3).join(' | '));
+    expect('no_pane_opened_by_itself',
+      !document.getElementById('fscreen-exit'),
+      'pane=' + !!document.getElementById('fscreen-exit'));
+    expect('nothing_entered_fullscreen',
+      !document.fullscreenElement,
+      document.fullscreenElement ? document.fullscreenElement.tagName : null);
+    expect('player_still_restored',
+      !document.getElementById('a').style.getPropertyValue('position'),
+      JSON.stringify(document.getElementById('a').getAttribute('style')));
+
+    window.__done = true;
+    document.getElementById('results').textContent = JSON.stringify(checks, null, 2);
+  })();
+})();
+</script>
+</body>
+</html>

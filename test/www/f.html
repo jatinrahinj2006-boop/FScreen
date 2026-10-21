@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>FScreen test F - the key must never die</title>
+<!--
+  Three failure modes this page reproduces, all reported in the field:
+
+  1. Focus sits in a frame with no player (an ad, a logo link, a secondary
+     embed). The keydown only reaches that frame, it resolves nothing, and no
+     other frame ever hears about the press - so the shortcut is simply dead.
+     The frame now hands the key to its parent.
+
+  2. The same physical key arrives twice: once as a page keydown, once as a
+     chrome.commands message in the top frame. The second copy used to toggle
+     the pane straight back off, which reads as "the shortcut did nothing".
+
+  3. The site replaces the player box while the pane is open (SPA re-render,
+     episode change). The pane used to be dropped, leaving the user pressing a
+     key that appears to do nothing every other time.
+-->
+<script>
+/* FIRST page script: document_start must already have patched the prototype. */
+window.__checks = {};
+(function (name, pass, detail) {
+  window.__checks[name] = { pass: !!pass, detail: detail === undefined ? null : detail };
+})('main_world_injected', !!window.__FSCREEN__, String(window.__FSCREEN__));
+</script>
+<style>
+  body { margin: 0; background: #111; color: #eee; font: 14px system-ui; }
+  #box { width: 640px; height: 360px; background: #06c; }
+  #alt { width: 640px; height: 360px; background: #0a5; margin-top: 8px; display: none; }
+  #other { width: 100px; height: 80px; border: 0; margin-top: 8px; display: block; }
+  #results { white-space: pre-wrap; padding: 16px; }
+</style>
+</head>
+<body>
+<div id="box"><video id="a"></video></div>
+<div id="alt"><video id="b"></video></div>
+<iframe id="other" src="novid.html"></iframe>
+<pre id="results">running...</pre>
+<script>
+(function () {
+  var checks = window.__checks;
+  function expect(name, pass, detail) {
+    checks[name] = { pass: !!pass, detail: detail === undefined ? null : detail };
+  }
+  var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+
+  // The test server delays every HTML response, and --virtual-time-budget
+  // fast-forwards page timers: a plain sleep() can expire long before the
+  // iframe document has actually arrived. Waiting on /realwait buys real time.
+  var realSleep = function (ms) {
+    return fetch('/realwait?ms=' + ms).then(function () { return null; })
+      .catch(function () { return sleep(ms); });
+  };
+
+  var box = document.getElementById('box');
+  var alt = document.getElementById('alt');
+  var frame = document.getElementById('other');
+  var pane = function () { return !!document.getElementById('fscreen-exit'); };
+  var pos = function (el) { return el.style.getPropertyValue('position'); };
+
+  // Dispatched in the CHILD realm: the child's own document_start listener is
+  // what a real keypress there would reach.
+  function press(child) {
+    var win = child ? frame.contentWindow : window;
+    var Ev = win.KeyboardEvent;
+    win.dispatchEvent(new Ev('keydown',
+      { key: '`', code: 'Backquote', altKey: true, bubbles: true, cancelable: true }));
+  }
+  // What the service worker relays when chrome.commands fires.
+  function command(cmd) {
+    window.postMessage({ __fscreen: 1, type: 'command', cmd: cmd }, '*');
+  }
+
+  (async function () {
+    await sleep(250);
+
+    /* 1. a key pressed inside a frame that has no player is handed upward */
+    var child = null;
+    for (var i = 0; i < 20 && !child; i++) {
+      await realSleep(250);
+      try {
+        var d = frame.contentDocument;
+        // Its own marker text: an iframe that has not loaded yet reports an
+        // empty document, which would make this check pass for the wrong
+        // reason and hand the key to a frame with no listener in it.
+        if (d && d.querySelector('p')) child = d;
+      } catch (e) { child = null; }
+    }
+    expect('child_frame_has_no_player',
+      !!child && !child.querySelector('video, iframe'),
+      child ? 'ready' : 'child document never became ready');
+
+    if (child) {
+      press(true);
+      await sleep(300);
+      expect('key_in_playerless_frame_reaches_parent',
+        pane() && pos(box) === 'fixed',
+        'pane=' + pane() + ' box=' + JSON.stringify(pos(box)));
+
+      var btn = document.getElementById('fscreen-exit');
+      var title = (btn && btn.title) || '';
+      /* 2. the exit button doubles as the "which build, which box" readout */
+      expect('exit_button_reports_build_and_target',
+        /^FScreen \d+\.\d+\.\d+: pane on /.test(title) && title.indexOf('#box') > -1,
+        title);
+
+      var m = title.match(/^FScreen (\d+\.\d+\.\d+)/);
+      expect('extension_build', !!m, m ? m[1] : null);
+
+      // data-fscreen-build is the content script's own constant; the title is
+      // what chrome.runtime.getManifest() reported. They must agree.
+      expect('build_markers_agree',
+        !!m && document.documentElement.dataset.fscreenBuild === m[1],
+        'manifest=' + (m && m[1]) + ' script=' + document.documentElement.dataset.fscreenBuild);
+
+      /* 3. a genuine command - well after the keypress - still works */
+      await sleep(250);
+      command('toggle');
+      await sleep(200);
+      expect('command_works_after_delay', !pane(),
+        'pane=' + pane() + ' box=' + JSON.stringify(pos(box)));
+
+      /* 4. one physical key delivered twice: the second copy is dropped */
+      press();
+      await sleep(120);
+      expect('reenter_ok', pane() && pos(box) === 'fixed',
+        'pane=' + pane() + ' box=' + JSON.stringify(pos(box)));
+
+      command('toggle');          // the same keypress, arriving as a command
+      await sleep(150);
+      expect('duplicate_command_dropped',
+        pane() && pos(box) === 'fixed',
+        'pane=' + pane() + ' box=' + JSON.stringify(pos(box)));
+
+      /* 5. ...but the window is a window, not a latch */
+      await sleep(400);
+      command('toggle');
+      await sleep(200);
+      expect('command_works_after_window', !pane(),
+        'pane=' + pane() + ' box=' + JSON.stringify(pos(box)));
+
+      /* 6. the site swaps the player box out from under the pane */
+      press();
+      await sleep(250);
+      expect('reenter_for_replacement', pane() && pos(box) === 'fixed',
+        'pane=' + pane() + ' box=' + JSON.stringify(pos(box)));
+
+      alt.style.display = 'block';
+      await sleep(80);
+      if (box.parentNode) box.parentNode.removeChild(box);
+      await sleep(400);
+
+      expect('pane_survives_player_replacement',
+        pane() && pos(alt) === 'fixed',
+        'pane=' + pane() + ' alt=' + JSON.stringify(pos(alt)));
+      expect('replacement_fills_tab',
+        Math.abs(parseFloat(getComputedStyle(alt).width) - window.innerWidth) < 3,
+        parseFloat(getComputedStyle(alt).width) + ' vs innerWidth ' + window.innerWidth);
+      expect('old_box_style_restored', pos(box) === '',
+        'position=' + JSON.stringify(pos(box)));
+
+      window.dispatchEvent(new win_escape());
+      await sleep(250);
+      expect('escape_after_replacement', !pane() && pos(alt) === '',
+        'pane=' + pane() + ' alt=' + JSON.stringify(pos(alt)));
+    } else {
+      expect('key_in_playerless_frame_reaches_parent', false, 'child never became readable');
+    }
+
+    window.__done = true;
+    document.getElementById('results').textContent = JSON.stringify(checks, null, 2);
+  })();
+
+  function win_escape() {
+    return new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true });
+  }
+})();
+</script>
+</body>
+</html>

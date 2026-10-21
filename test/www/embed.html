@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>FScreen test B embed (cross-origin child)</title>
+<style>
+  body { margin: 0; background: #000; color: #fff; font: 14px system-ui; }
+  #player { width: 640px; height: 360px; background: #0a5; position: relative; }
+</style>
+</head>
+<body>
+<div id="player">
+  <video id="v"></video>
+  <button id="fs">Fullscreen</button>
+</div>
+<script>
+/*
+ * NOTE: everything here is reported *synchronously*. This frame sits on a
+ * different origin, so site isolation puts it in its own renderer process, and
+ * --virtual-time-budget only drives timers in the main frame's process. Any
+ * setTimeout in here simply never fires under the test harness - which is a
+ * harness limitation, not an extension one.
+ */
+(function () {
+  var player = document.getElementById('player');
+  var btn = document.getElementById('fs');
+
+  // Interception is opt-in (the toolbar icon does exactly this). Posted at
+  // parse time so it is already applied by the time the parent says "go" -
+  // this frame has no timers under the harness, so it has to be a message.
+  window.postMessage({ __fscreen: 1, type: 'state', enabled: true }, '*');
+
+  btn.addEventListener('click', function () {
+    player.requestFullscreen().catch(function () {});
+  });
+
+  function report(name, pass, detail) {
+    try {
+      window.parent.postMessage({ __fstest: 1, name: name, pass: pass, detail: detail }, '*');
+    } catch (e) { /* ignore */ }
+  }
+  function pos() { return player.style.getPropertyValue('position'); }
+  function fsEl() { return document.fullscreenElement; }
+
+  report('child_loaded', true, location.href);
+
+  window.addEventListener('message', function (e) {
+    var d = e.data;
+    if (!d) return;
+
+    if (d.__fstest === 1 && d.go) {
+      report('child_got_go', true, null);
+      try {
+        btn.click();               // our override applies every style synchronously
+        report('child_clicked', true, null);
+        report('child_position_fixed', pos() === 'fixed', pos());
+        report('child_fakes_fullscreenElement', fsEl() === player,
+          fsEl() && (fsEl().id || fsEl().tagName));
+        report('child_shows_exit_button', !!document.getElementById('fscreen-exit'));
+        report('child_style_sheet', !!document.getElementById('fscreen-style'));
+        report('child_fill_width',
+          Math.abs(parseFloat(getComputedStyle(player).width) - window.innerWidth) < 4,
+          getComputedStyle(player).width + ' vs ' + window.innerWidth);
+        // Where did the styles actually land? (diagnostic for the target resolver)
+        report('child_ancestor_styles', true,
+          'body=' + document.body.style.getPropertyValue('position') +
+          ' html=' + document.documentElement.style.getPropertyValue('position'));
+      } catch (err) {
+        report('child_click_error', false, String((err && err.stack) || err));
+      }
+      return;
+    }
+
+    // The parent content script sends this when the top document leaves
+    // pseudo-fullscreen, so the embed has to stand down too. Our listener was
+    // registered before the page's, so by the time we run here the extension
+    // has already handled it.
+    if (d.__fscreen === 1 && d.type === 'command' && d.cmd === 'exit') {
+      report('child_sees_parent_exit', pos() === '', JSON.stringify(pos()));
+      report('child_button_removed', !document.getElementById('fscreen-exit'), null);
+      report('child_fullscreen_cleared', fsEl() === null, String(fsEl()));
+    }
+  });
+})();
+</script>
+</body>
+</html>

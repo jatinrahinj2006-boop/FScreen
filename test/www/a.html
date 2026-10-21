@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>FScreen test A - single frame</title>
+<script>
+/* FIRST page script. document_start must have already patched the prototype.
+   Results are written in the same {pass, detail} shape as the rest. */
+window.__checks = {};
+(function (name, pass, detail) {
+  window.__checks[name] = { pass: !!pass, detail: detail === undefined ? null : detail };
+})('main_world_injected', !!window.__FSCREEN__, String(window.__FSCREEN__));
+(function (name, pass, detail) {
+  window.__checks[name] = { pass: !!pass, detail: detail === undefined ? null : detail };
+})('boot_marker_at_head',
+  document.documentElement.getAttribute('data-fscreen') === '1',
+  document.documentElement.getAttribute('data-fscreen'));
+(function (name, pass, detail) {
+  window.__checks[name] = { pass: !!pass, detail: detail === undefined ? null : detail };
+})('override_before_page_scripts',
+  /fakeRequest/.test(String(Element.prototype.requestFullscreen)),
+  String(Element.prototype.requestFullscreen).slice(0, 70));
+(function (name, pass, detail) {
+  window.__checks[name] = { pass: !!pass, detail: detail === undefined ? null : detail };
+})('exit_override_before_page_scripts',
+  /fakeExit/.test(String(Document.prototype.exitFullscreen)),
+  String(Document.prototype.exitFullscreen).slice(0, 70));
+/* Interception is opt-in (the toolbar icon does exactly this): tell the
+   MAIN-world script to intercept, the way a click on the icon would. */
+window.postMessage({ __fscreen: 1, type: 'state', enabled: true }, '*');
+</script>
+<style>
+  body { margin: 0; background: #111; color: #eee; font: 14px system-ui; }
+  /* transform on an ancestor creates a containing block for position:fixed.
+     If FScreen fails to neutralise this, the player fills #stage, not the tab. */
+  #stage { transform: translateZ(0); padding: 30px; }
+  #player { width: 320px; height: 180px; background: #06c; position: relative; }
+  #results { white-space: pre-wrap; padding: 16px; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="player">
+    <video id="v"></video>
+    <button id="fs">Fullscreen</button>
+  </div>
+</div>
+<pre id="results">running...</pre>
+<script>
+(function () {
+  var checks = window.__checks;
+  // Second probe: if these are true here but false in <head>, the content script
+  // landed mid-document instead of before the first page script.
+  function probe(name, pass, detail) {
+    checks[name] = { pass: !!pass, detail: detail === undefined ? null : detail };
+  }
+  probe('flag_at_body_start', !!window.__FSCREEN__, String(window.__FSCREEN__));
+  probe('boot_marker_at_body_start',
+    document.documentElement.getAttribute('data-fscreen') === '1',
+    document.documentElement.getAttribute('data-fscreen'));
+  probe('override_at_body_start',
+    /fakeRequest/.test(String(Element.prototype.requestFullscreen)),
+    String(Element.prototype.requestFullscreen).slice(0, 70));
+  probe('exit_override_at_body_start',
+    /fakeExit/.test(String(Document.prototype.exitFullscreen)),
+    String(Document.prototype.exitFullscreen).slice(0, 70));
+  var player = document.getElementById('player');
+  var btn = document.getElementById('fs');
+  var stage = document.getElementById('stage');
+  var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+
+  // Exactly what a real player does with its own fullscreen button.
+  btn.addEventListener('click', function () {
+    player.requestFullscreen().catch(function () {});
+  });
+
+  var pos = function () { return player.style.getPropertyValue('position'); };
+  var fsEl = function () { return document.fullscreenElement; };
+  function expect(name, pass, detail) {
+    checks[name] = { pass: !!pass, detail: detail === undefined ? null : detail };
+  }
+  function px(el, prop) { return parseFloat(getComputedStyle(el)[prop]); }
+
+  (async function () {
+    await sleep(80);
+
+    /* 1. enter through the site's own button */
+    btn.click();
+    await sleep(80);
+    expect('enter_position_fixed', pos() === 'fixed', pos());
+    expect('enter_fills_tab_viewport',
+      Math.abs(px(player, 'width') - window.innerWidth) < 3,
+      px(player, 'width') + ' vs innerWidth ' + window.innerWidth);
+    expect('enter_height',
+      Math.abs(px(player, 'height') - window.innerHeight) < 3,
+      px(player, 'height') + ' vs innerHeight ' + window.innerHeight);
+    expect('enter_zindex', getComputedStyle(player).zIndex === '2147483647', getComputedStyle(player).zIndex);
+    expect('enter_fakes_fullscreenElement', fsEl() === player, fsEl() && (fsEl().id || fsEl().tagName));
+    expect('enter_exit_button', !!document.getElementById('fscreen-exit'));
+    expect('enter_style_sheet', !!document.getElementById('fscreen-style'));
+    expect('ancestor_transform_neutralised',
+      getComputedStyle(stage).transform === 'none', getComputedStyle(stage).transform);
+    expect('html_scroll_locked', document.documentElement.style.overflow === 'hidden',
+      JSON.stringify(document.documentElement.style.overflow));
+
+    /* 2. Escape exits and restores everything */
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    await sleep(80);
+    expect('esc_exits', pos() === '', JSON.stringify(pos()));
+    expect('esc_clears_fullscreenElement', fsEl() === null, String(fsEl()));
+    expect('esc_removes_button', !document.getElementById('fscreen-exit'));
+    expect('esc_removes_style_sheet', !document.getElementById('fscreen-style'));
+    expect('esc_restores_ancestor_transform',
+      getComputedStyle(stage).transform !== 'none', getComputedStyle(stage).transform);
+    expect('esc_unlocks_scroll', document.documentElement.style.overflow === '',
+      JSON.stringify(document.documentElement.style.overflow));
+
+    /* 3. the site's own button toggles back off */
+    btn.click(); await sleep(80);
+    expect('reenter_ok', pos() === 'fixed', pos());
+    btn.click(); await sleep(80);
+    expect('site_button_toggles_off', pos() === '', pos());
+
+    /* 4. document.exitFullscreen() exits */
+    btn.click(); await sleep(80);
+    try { await document.exitFullscreen(); } catch (e) {}
+    await sleep(80);
+    expect('exitFullscreen_api_works', pos() === '', pos());
+
+    /* 5. Alt+` hotkey (the 200ms double-fire guard means the second press has
+          to land more than 200ms after the first) */
+    window.dispatchEvent(new KeyboardEvent('keydown',
+      { key: '`', code: 'Backquote', altKey: true, bubbles: true, cancelable: true }));
+    await sleep(320);
+    expect('hotkey_enters', pos() === 'fixed', pos());
+    window.dispatchEvent(new KeyboardEvent('keydown',
+      { key: '`', code: 'Backquote', altKey: true, bubbles: true, cancelable: true }));
+    await sleep(150);
+    expect('hotkey_exits', pos() === '', pos());
+
+    /* 6. MutationObserver: SPA re-render drops our styles -> we re-assert */
+    btn.click(); await sleep(80);
+    expect('reenter_before_mo', pos() === 'fixed', pos());
+    player.style.position = 'relative';
+    player.style.width = '320px';
+    await sleep(500);
+    expect('mo_reasserts_styles', pos() === 'fixed',
+      pos() + ' / fsEl=' + (fsEl() && (fsEl().id || fsEl().tagName)));
+
+    /* 7. MutationObserver: player removed from the DOM -> we stand down */
+    stage.remove();
+    await sleep(600);
+    expect('mo_exits_when_player_removed', !document.getElementById('fscreen-exit'),
+      document.getElementById('fscreen-exit') ? 'button still present' : 'button gone');
+    expect('mo_frees_fullscreenElement', fsEl() === null, String(fsEl()));
+
+    window.__done = true;
+    document.getElementById('results').textContent = JSON.stringify(checks, null, 2);
+  })();
+})();
+</script>
+</body>
+</html>

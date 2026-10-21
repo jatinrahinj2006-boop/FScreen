@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>FScreen test C - Trusted Types page + fullscreenElement identity</title>
+<!--
+  This page is served with
+      Content-Security-Policy: require-trusted-types-for 'script'
+  which is what youtube.com sends. Two bugs reproduce there:
+
+  1. The exit button used to be built with innerHTML. Under Trusted Types that
+     assignment throws *inside* enterPseudo(), so the transition aborted before
+     dispatching fullscreenchange/resize: the site never re-measured its video
+     (stale pixel sizes, black bars) and its fullscreen key looked dead.
+  2. We reported the element we styled back from document.fullscreenElement
+     instead of the element the page asked for. YouTube only calls
+     exitFullscreen() when fullscreenElement === the element it requested, so
+     its own toggle could never exit.
+-->
+<script>
+/* FIRST page script: document_start must already have patched the prototype. */
+window.__checks = {};
+(function (name, pass, detail) {
+  window.__checks[name] = { pass: !!pass, detail: detail === undefined ? null : detail };
+})('main_world_injected', !!window.__FSCREEN__, String(window.__FSCREEN__));
+/* Interception is opt-in (the toolbar icon does exactly this): tell the
+   MAIN-world script to intercept, the way a click on the icon would. */
+window.postMessage({ __fscreen: 1, type: 'state', enabled: true }, '*');
+</script>
+<style>
+  body { margin: 0; background: #111; color: #eee; font: 14px system-ui; }
+  #stage { padding: 30px; }
+  #player { width: 320px; height: 180px; background: #06c; position: relative; }
+  #results { white-space: pre-wrap; padding: 16px; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="player">
+    <video id="v"></video>
+    <button id="fs">Fullscreen</button>
+  </div>
+</div>
+<pre id="results">running...</pre>
+<script>
+(function () {
+  var checks = window.__checks;
+  function expect(name, pass, detail) {
+    checks[name] = { pass: !!pass, detail: detail === undefined ? null : detail };
+  }
+  var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+
+  var player = document.getElementById('player');
+  var stage = document.getElementById('stage');
+  var btn = document.getElementById('fs');
+  var html = document.documentElement;
+  var fsEl = function () { return document.fullscreenElement; };
+  var pos = function (el) { return el.style.getPropertyValue('position'); };
+  function px(el, prop) { return parseFloat(getComputedStyle(el)[prop]); }
+
+  // The page must really enforce Trusted Types, otherwise everything below is
+  // a test of nothing.
+  var enforced = false, thrown = null;
+  try { var probe = document.createElement('div'); probe.innerHTML = '<b>x</b>'; }
+  catch (e) { enforced = true; thrown = e.message; }
+  expect('trusted_types_enforced', enforced, thrown);
+
+  var changes = 0;
+  document.addEventListener('fullscreenchange', function () { changes++; });
+
+  // Exactly what a real player's own fullscreen button does.
+  btn.addEventListener('click', function () {
+    player.requestFullscreen().catch(function () {});
+  });
+
+  (async function () {
+    await sleep(80);
+
+    /* --- 1. entering must survive a Trusted Types page ------------------ */
+    var enterErr = null;
+    try { await html.requestFullscreen(); } catch (e) { enterErr = e.message; }
+    await sleep(150);
+
+    expect('enter_does_not_throw_under_tt', enterErr === null, enterErr);
+    expect('enter_dispatches_fullscreenchange', changes > 0, changes);
+    expect('enter_fills_viewport',
+      !!document.getElementById('fscreen-style') &&
+      [player, stage].some(function (el) {
+        return pos(el) === 'fixed' &&
+               Math.abs(px(el, 'width') - window.innerWidth) < 3 &&
+               Math.abs(px(el, 'height') - window.innerHeight) < 3;
+      }),
+      'stage=' + pos(stage) + '/' + px(stage, 'width') + ' player=' + pos(player) + '/' + px(player, 'width') +
+      ' innerWidth=' + window.innerWidth);
+
+    var exitBtn = document.getElementById('fscreen-exit');
+    expect('exit_button_created_under_tt', !!exitBtn, exitBtn ? 'present' : 'missing');
+    expect('exit_button_built_without_innerhtml', !!(exitBtn && exitBtn.querySelector('svg')),
+      exitBtn ? String(!!exitBtn.querySelector('svg')) : 'no button');
+
+    /* --- 2. report back the element the page asked for ------------------ */
+    // We asked for <html> (YouTube's path) but must not freeze the page.
+    expect('fullscreen_element_is_requester', fsEl() === html,
+      fsEl() ? (fsEl().id || fsEl().tagName) : String(fsEl()));
+    expect('page_element_not_styled', pos(html) !== 'fixed', pos(html));
+
+    /* --- 3. exit exactly the way YouTube decides to ---------------------- */
+    // YouTube: lG(XA()) -> only calls exitFullscreen() when the fullscreen
+    // element still equals the one it requested.
+    var ytWouldExit = fsEl() === html;
+    expect('site_would_call_exit', ytWouldExit, String(fsEl() && (fsEl().id || fsEl().tagName)));
+    if (ytWouldExit) { try { await document.exitFullscreen(); } catch (e) {} }
+    await sleep(150);
+
+    expect('exit_clears_fullscreen_element', fsEl() === null, String(fsEl()));
+    expect('exit_removes_button', !document.getElementById('fscreen-exit'));
+    expect('exit_removes_style_sheet', !document.getElementById('fscreen-style'));
+    expect('exit_restores_position', pos(stage) === '' && pos(player) === '',
+      'stage=' + pos(stage) + ' player=' + pos(player));
+
+    /* --- 4. a normal element request still reports that element --------- */
+    btn.click();
+    await sleep(150);
+    expect('second_enter_reports_player', fsEl() === player,
+      fsEl() ? (fsEl().id || fsEl().tagName) : String(fsEl()));
+    expect('second_enter_styles_player', pos(player) === 'fixed', pos(player));
+
+    window.dispatchEvent(new KeyboardEvent('keydown',
+      { key: 'Escape', bubbles: true, cancelable: true }));
+    await sleep(150);
+    expect('escape_exits', fsEl() === null && !document.getElementById('fscreen-exit'),
+      String(fsEl()));
+
+    window.__done = true;
+    document.getElementById('results').textContent = JSON.stringify(checks, null, 2);
+  })();
+})();
+</script>
+</body>
+</html>
